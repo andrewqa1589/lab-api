@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Payments demo</title>
+</head>
+<body>
+  <h1>Create payment</h1>
+
+  <form id="paymentForm">
+    <input type="number" id="amount" placeholder="Amount" required />
+    <input type="text" id="currency" placeholder="Currency" value="KGS" required />
+    <input type="text" id="userId" placeholder="User ID" required />
+    <button type="submit">Send</button>
+  </form>
+
+  <pre id="result"></pre>
+
+<script>
+  const form = document.getElementById("paymentForm");
+  const result = document.getElementById("result");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const data = {
+      amount: document.getElementById("amount").value,
+      currency: document.getElementById("currency").value,
+      userId: document.getElementById("userId").value,
+    };
+
+    const res = await fetch("/api/payments", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": "test_api_key_123"
+      },
+      body: JSON.stringify(data)
+    });
+
+    let json;
+    try {
+      json = await res.json();
+    } catch (e) {
+      json = { ok: false, error: "Response is not JSON" };
+    }
+
+    result.textContent =
+      `HTTP ${res.status}\n` + JSON.stringify(json, null, 2);
+  });
+</script>
+
+</body>
+</html>
