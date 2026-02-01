@@ -1,24 +1,33 @@
-// src/controllers/callback.controller.js
-
-const { getPayment, updateStatus } = require("../services/payments.store");
+// Берём функции из store (теперь это SQLite-store)
+const {
+  getPayment,
+  updateStatus,
+  updatePartnerInfo,
+} = require("../services/payments.store");
 
 // POST /api/callback
+// Это "сигнал" от партнёра: мы его НЕ считаем истиной.
+// Мы всё равно идём сами проверять статус у партнёра и делаем confirm.
 async function callbackController(req, res) {
-  // Signal from partner (we don't trust it as truth)
+  // Что пришло от партнёра (учебный формат)
   const { paymentId, status } = req.body || {};
 
-  // Validate input
+  // 1) Валидация входа
   if (!paymentId) {
     return res.status(400).json({ ok: false, error: "paymentId required" });
   }
 
-  // Find payment in our store
+  // 2) Ищем платёж у себя в БД
+  // Важно: getPayment теперь async (SQLite), поэтому await
   const p = await getPayment(String(paymentId));
   if (!p) {
-    return res.status(404).json({ ok: false, error: "payment not found", paymentId });
+    return res
+      .status(404)
+      .json({ ok: false, error: "payment not found", paymentId });
   }
 
-  // Idempotency: if already finalized - do nothing
+  // 3) Идемпотентность:
+  // если платёж уже финальный (confirmed/failed) — ничего не делаем
   if (p.status === "confirmed" || p.status === "failed") {
     return res.json({
       ok: true,
@@ -28,16 +37,19 @@ async function callbackController(req, res) {
     });
   }
 
-  // учебное упрощение: partnerPaymentId = наш paymentId
+  // 4) Учебное упрощение:
+  // partnerPaymentId = наш paymentId
   const partnerPaymentId = String(paymentId);
 
-  // прокидываем ключ, т.к. /api/partner/ защищён apiKeyAuth
+  // 5) Прокидываем API ключ, т.к. /api/partner/ защищён apiKeyAuth
   const apiKey = req.header("X-API-Key");
 
-  // "партнёр" сейчас мокается на этом же сервисе
+  // 6) "Партнёр" мокается на этом же сервисе
   const baseUrl = "http://127.0.0.1:3000";
 
-  // A) STATUS CHECK (verify)
+  // ============================================================
+  // A) STATUS CHECK (verify) — проверяем реальный статус у партнёра
+  // ============================================================
   const statusResp = await fetch(
     `${baseUrl}/api/partner/status/${encodeURIComponent(partnerPaymentId)}`,
     { headers: { "X-API-Key": apiKey } }
@@ -53,9 +65,27 @@ async function callbackController(req, res) {
 
   const partnerStatus = await statusResp.json();
 
-  // If partner says failed -> finalize as failed
+  // 7) Сохраняем в БД то, что мы знаем на этом этапе:
+  // - что прислал callback (receivedCallbackStatus)
+  // - какой статус вернул partner/status
+  // - сырой ответ partner/status (как JSON строку)
+  await updatePartnerInfo(String(paymentId), {
+    partnerPaymentId,
+    callbackStatus: status ?? null,
+    partnerStatus: partnerStatus.status ?? null,
+    partnerStatusRaw: JSON.stringify(partnerStatus),
+  });
+
+  // Если партнёр говорит "failed" — финализируем как failed
   if (partnerStatus.status === "failed") {
-    const updated = updateStatus(String(paymentId), "failed");
+    // Запишем причину (полезно для разборов)
+    await updatePartnerInfo(String(paymentId), {
+      failedReason: "partner status failed",
+    });
+
+    // Важно: updateStatus async => await
+    const updated = await updateStatus(String(paymentId), "failed");
+
     return res.json({
       ok: true,
       mode: "signal_then_confirm",
@@ -66,7 +96,9 @@ async function callbackController(req, res) {
     });
   }
 
-  // B) CONFIRM (finalize)
+  // ============================================================
+  // B) CONFIRM (finalize) — подтверждаем у партнёра (делаем confirm)
+  // ============================================================
   const confirmResp = await fetch(`${baseUrl}/api/partner/confirm`, {
     method: "POST",
     headers: {
@@ -76,7 +108,7 @@ async function callbackController(req, res) {
     body: JSON.stringify({ partnerPaymentId }),
   });
 
-  // Improvement: 409 means "cannot confirm" -> treat as failed
+  // Improvement: 409 означает "нельзя подтвердить" -> считаем failed
   if (confirmResp.status === 409) {
     let partnerConfirmError = null;
     try {
@@ -85,7 +117,14 @@ async function callbackController(req, res) {
       partnerConfirmError = { ok: false, error: "partner confirm returned 409" };
     }
 
+    // Сохраняем в БД сырой ответ confirm + причину фейла
+    await updatePartnerInfo(String(paymentId), {
+      failedReason: "partner confirm 409",
+      partnerConfirmRaw: JSON.stringify(partnerConfirmError),
+    });
+
     const updated = await updateStatus(String(paymentId), "failed");
+
     return res.json({
       ok: true,
       mode: "signal_then_confirm",
@@ -107,7 +146,12 @@ async function callbackController(req, res) {
 
   const partnerConfirm = await confirmResp.json();
 
-  // Only after successful confirm -> confirmed
+  // Сохраняем сырой успешный confirm (для истории / отладки)
+  await updatePartnerInfo(String(paymentId), {
+    partnerConfirmRaw: JSON.stringify(partnerConfirm),
+  });
+
+  // 8) Только после успешного confirm ставим confirmed у себя
   const updated = await updateStatus(String(paymentId), "confirmed");
 
   return res.json({
