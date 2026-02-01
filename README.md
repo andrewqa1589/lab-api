@@ -4,5 +4,5 @@ Educational Node.js + Express backend
 Learning payment architecture
 
 
-## Endpoints (A)
+## Endpoints
 - POST /api/payments
