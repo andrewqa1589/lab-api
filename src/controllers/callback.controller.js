@@ -13,7 +13,7 @@ async function callbackController(req, res) {
   }
 
   // Find payment in our store
-  const p = getPayment(String(paymentId));
+  const p = await getPayment(String(paymentId));
   if (!p) {
     return res.status(404).json({ ok: false, error: "payment not found", paymentId });
   }
@@ -85,7 +85,7 @@ async function callbackController(req, res) {
       partnerConfirmError = { ok: false, error: "partner confirm returned 409" };
     }
 
-    const updated = updateStatus(String(paymentId), "failed");
+    const updated = await updateStatus(String(paymentId), "failed");
     return res.json({
       ok: true,
       mode: "signal_then_confirm",
@@ -108,7 +108,7 @@ async function callbackController(req, res) {
   const partnerConfirm = await confirmResp.json();
 
   // Only after successful confirm -> confirmed
-  const updated = updateStatus(String(paymentId), "confirmed");
+  const updated = await updateStatus(String(paymentId), "confirmed");
 
   return res.json({
     ok: true,
