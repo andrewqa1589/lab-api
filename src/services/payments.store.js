@@ -1,51 +1,84 @@
-// In-memory store (хранилище в памяти)
-// Это наша "база данных", пока без настоящей БД.
-//
-// Формат:
-// paymentsById = {
-//   "pay_xxx": { paymentObject },
-//   "pay_yyy": { paymentObject }
-// }
+const db = require("../db/sqlite");
 
-const paymentsById = Object.create(null);
-// создаём пустой объект без prototype
-// будем использовать как словарь: id -> payment
+// ---- Promise wrappers for sqlite3 callback API ----
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve(this); // this.changes, this.lastID
+    });
+  });
+}
 
-// Сохранить платёж в память
-function savePayment(payment) {
-  // кладём объект платежа по ключу его id
-  paymentsById[payment.id] = payment;
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row || null);
+    });
+  });
+}
 
-  // возвращаем сохранённый объект
+// ---- Row -> payment object mapping (keep old API shape) ----
+function mapRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    status: row.status,
+    amount: row.amount,
+    currency: row.currency,
+    userId: row.user_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at ?? undefined,
+
+    // partner-related fields (optional)
+    partnerPaymentId: row.partner_payment_id ?? undefined,
+    callbackStatus: row.callback_status ?? undefined,
+    partnerStatus: row.partner_status ?? undefined,
+    partnerStatusRaw: row.partner_status_raw ?? undefined,
+    partnerConfirmRaw: row.partner_confirm_raw ?? undefined,
+    failedReason: row.failed_reason ?? undefined,
+  };
+}
+
+// ---- Store API ----
+async function savePayment(payment) {
+  await run(
+    `
+    INSERT INTO payments (id, amount, currency, status, user_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      payment.id,
+      payment.amount,
+      payment.currency,
+      payment.status,
+      payment.userId,
+      payment.createdAt,
+      payment.updatedAt ?? null,
+    ]
+  );
+
   return payment;
 }
 
-// Получить платёж по id
-function getPayment(id) {
-  // если такой id есть → вернём объект
-  // если нет → вернём null
-  return paymentsById[id] || null;
+async function getPayment(id) {
+  const row = await get(`SELECT * FROM payments WHERE id = ?`, [id]);
+  return mapRow(row);
 }
 
-// Обновить только статус платежа
-function updateStatus(id, status) {
-  // пытаемся найти платёж
-  const p = paymentsById[id];
+async function updateStatus(id, status) {
+  const updatedAt = new Date().toISOString();
 
-  // если нет такого платежа → выходим
-  if (!p) return null;
+  const result = await run(
+    `UPDATE payments SET status = ?, updated_at = ? WHERE id = ?`,
+    [status, updatedAt, id]
+  );
 
-  // меняем статус
-  p.status = status;
-
-  // записываем дату обновления
-  p.updatedAt = new Date().toISOString();
-
-  // возвращаем обновлённый объект
-  return p;
+  if (result.changes === 0) return null;
+  return getPayment(id);
 }
 
-// Экспортируем функции наружу
 module.exports = {
   savePayment,
   getPayment,
