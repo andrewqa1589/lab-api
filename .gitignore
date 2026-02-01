@@ -7,3 +7,6 @@ yarn-error.log*
 dist/
 build/
 coverage/
+data/
+*.db
+src/test-db.js
