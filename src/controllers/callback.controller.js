@@ -2,13 +2,11 @@
 //
 // Главная идея:
 // - callback — это СИГНАЛ, а не истина
-// - мы НЕ верим статусу из callback
+// - мы НЕ верим статусу из callback напрямую
 // - мы САМИ:
 //   1) проверяем статус у партнёра (verify)
 //   2) подтверждаем платёж у партнёра (confirm)
 //   3) только потом финализируем платёж у себя
-//
-// Этот файл — сердце платёжного флоу.
 
 const {
   getPayment,
@@ -16,42 +14,31 @@ const {
   updatePartnerInfo,
 } = require("../services/payments.store");
 
-// Логирование событий платежа (для саппорта и расследований)
 const { logPaymentEvent } = require("../services/payments.events");
 
 // POST /api/callback
 async function callbackController(req, res) {
   // 1) Достаём данные из callback
-  // Обычно партнёр присылает хотя бы paymentId и статус
   const { paymentId, status } = req.body || {};
 
-  // 2) Проверяем, что paymentId вообще пришёл
+  // 2) Проверяем, что paymentId пришёл
   if (!paymentId) {
-    return res.status(400).json({
-      ok: false,
-      error: "paymentId required",
-    });
+    return res.status(400).json({ ok: false, error: "paymentId required" });
   }
 
-  // Логируем сам факт получения callback
+  // Логируем факт callback
   logPaymentEvent("callback_received", {
     paymentId: String(paymentId),
     callbackStatus: status ?? null,
   });
 
   // 3) Ищем платёж у себя в базе
-  // Важно: getPayment асинхронный (SQLite)
   const payment = await getPayment(String(paymentId));
   if (!payment) {
-    return res.status(404).json({
-      ok: false,
-      error: "payment not found",
-      paymentId,
-    });
+    return res.status(404).json({ ok: false, error: "payment not found", paymentId });
   }
 
-  // 4) Идемпотентность
-  // Если платёж уже финализирован — НИЧЕГО не делаем
+  // 4) Идемпотентность: если уже финализирован — ничего не делаем
   if (payment.status === "confirmed" || payment.status === "failed") {
     logPaymentEvent("idempotent_skip", {
       paymentId: String(paymentId),
@@ -66,32 +53,47 @@ async function callbackController(req, res) {
     });
   }
 
-  // 5) Учебное упрощение:
-  // считаем, что partnerPaymentId = наш paymentId
+  // 5) Учебное упрощение
   const partnerPaymentId = String(paymentId);
 
-  // 6) Берём API ключ из входящего запроса
-  // (в реальности часто используется отдельный серверный ключ)
+  // 6) Берём API ключ
   const apiKey = req.header("X-API-Key");
+  if (!apiKey) {
+    // Важно: без ключа мы не можем делать verify/confirm к партнёру
+    logPaymentEvent("auth_missing_api_key", {
+      paymentId: String(paymentId),
+      header: "X-API-Key",
+    });
+
+    return res.status(401).json({
+      ok: false,
+      error: "X-API-Key header required",
+    });
+  }
 
   // 7) В учебном проекте партнёр "мокается" на этом же сервисе
-  // В реальности тут будет URL внешнего API партнёра
   const baseUrl = "http://127.0.0.1:3000";
 
   // =====================================================
   // A) VERIFY — проверяем реальный статус у партнёра
   // =====================================================
+  logPaymentEvent("partner_status_request", {
+    paymentId: String(paymentId),
+    partnerPaymentId,
+  });
+
   const statusResp = await fetch(
     `${baseUrl}/api/partner/status/${encodeURIComponent(partnerPaymentId)}`,
-    {
-      headers: {
-        "X-API-Key": apiKey,
-      },
-    }
+    { headers: { "X-API-Key": apiKey } }
   );
 
-  // Если партнёрский API недоступен — это bad gateway
   if (!statusResp.ok) {
+    logPaymentEvent("partner_status_http_error", {
+      paymentId: String(paymentId),
+      partnerPaymentId,
+      httpStatus: statusResp.status,
+    });
+
     return res.status(502).json({
       ok: false,
       error: "partner status request failed",
@@ -99,30 +101,39 @@ async function callbackController(req, res) {
     });
   }
 
-  // Ответ партнёра (обычно JSON)
   const partnerStatus = await statusResp.json();
 
-  // Сохраняем партнёрскую информацию в БД
-  // Даже если дальше что-то упадёт — эти данные останутся
+  // Защита от мусорного ответа партнёра
+  const partnerStatusValue = partnerStatus?.status;
+  if (typeof partnerStatusValue !== "string") {
+    logPaymentEvent("partner_status_invalid", {
+      paymentId: String(paymentId),
+      partnerPaymentId,
+      partnerStatusRaw: JSON.stringify(partnerStatus),
+    });
+
+    return res.status(502).json({
+      ok: false,
+      error: "partner status invalid response",
+    });
+  }
+
   await updatePartnerInfo(String(paymentId), {
     partnerPaymentId,
     callbackStatus: status ?? null,
-    partnerStatus: partnerStatus.status ?? null,
+    partnerStatus: partnerStatusValue,
     partnerStatusRaw: JSON.stringify(partnerStatus),
   });
 
   logPaymentEvent("partner_status_ok", {
     paymentId: String(paymentId),
     partnerPaymentId,
-    partnerStatus: partnerStatus.status ?? null,
+    partnerStatus: partnerStatusValue,
   });
 
-  // Если партнёр сказал FAILED — сразу финализируем как failed
-  if (partnerStatus.status === "failed") {
-    await updatePartnerInfo(String(paymentId), {
-      failedReason: "partner_status_failed",
-    });
-
+  // Если FAILED — сразу финализируем как failed
+  if (partnerStatusValue === "failed") {
+    await updatePartnerInfo(String(paymentId), { failedReason: "partner_status_failed" });
     const updated = await updateStatus(String(paymentId), "failed");
 
     logPaymentEvent("final_failed", {
@@ -143,6 +154,11 @@ async function callbackController(req, res) {
   // =====================================================
   // B) CONFIRM — подтверждаем платёж у партнёра
   // =====================================================
+  logPaymentEvent("partner_confirm_request", {
+    paymentId: String(paymentId),
+    partnerPaymentId,
+  });
+
   const confirmResp = await fetch(`${baseUrl}/api/partner/confirm`, {
     method: "POST",
     headers: {
@@ -152,7 +168,6 @@ async function callbackController(req, res) {
     body: JSON.stringify({ partnerPaymentId }),
   });
 
-  // Если confirm невозможен (например 409) — считаем failed
   if (confirmResp.status === 409) {
     let partnerConfirmError;
     try {
@@ -184,8 +199,13 @@ async function callbackController(req, res) {
     });
   }
 
-  // Любая другая ошибка партнёра — тоже 502
   if (!confirmResp.ok) {
+    logPaymentEvent("partner_confirm_http_error", {
+      paymentId: String(paymentId),
+      partnerPaymentId,
+      httpStatus: confirmResp.status,
+    });
+
     return res.status(502).json({
       ok: false,
       error: "partner confirm failed",
@@ -193,10 +213,8 @@ async function callbackController(req, res) {
     });
   }
 
-  // Успешный confirm
   const partnerConfirm = await confirmResp.json();
 
-  // Сохраняем сырой confirm в БД
   await updatePartnerInfo(String(paymentId), {
     partnerConfirmRaw: JSON.stringify(partnerConfirm),
   });
@@ -207,14 +225,11 @@ async function callbackController(req, res) {
     partnerConfirmId: partnerConfirm.partnerConfirmId ?? null,
   });
 
-  // 8) Только ПОСЛЕ успешного confirm ставим confirmed у себя
+  // Только после успешного confirm ставим confirmed у себя
   const updated = await updateStatus(String(paymentId), "confirmed");
 
-  logPaymentEvent("final_confirmed", {
-    paymentId: String(paymentId),
-  });
+  logPaymentEvent("final_confirmed", { paymentId: String(paymentId) });
 
-  // 9) Возвращаем итог клиенту
   return res.json({
     ok: true,
     mode: "signal_then_confirm",
